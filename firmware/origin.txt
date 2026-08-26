@@ -1,0 +1,24 @@
+# The following files are extracted from adt3-user-12-STT1.211025.001.Z4-7928920-release-keys.
+
+bluetooth/bcm20703a2/BCM20703A2.hcd
+bluetooth/bcm20710a1/BCM20702.hcd
+bluetooth/bcm2076b1/BCM2076.hcd
+bluetooth/bcm40183b2/BCM4330.hcd
+bluetooth/bcm43241b4/bcm43241b4.hcd
+bluetooth/bcm43341b0/bcm43341b0.hcd
+bluetooth/bcm4335c0/bcm4335c0.hcd
+bluetooth/bcm43438a0/4343.hcd
+bluetooth/bcm4345c5/BCM4345C5.hcd
+bluetooth/bcm4354a1/BCM4350.hcd
+bluetooth/bcm43569a2/bcm43569a2.hcd
+bluetooth/bcm4356a2/BCM4354.hcd
+bluetooth/bcm4359c0/BCM4359C0.hcd
+bluetooth/bcm4362a1/BCM4362A1.hcd
+
+# The following files are extracted from sabrina_prod_stable-user-10-QTS1.210311.008-7350836-release-keys.
+bluetooth/bcm4359c0/sabrina/BCM4359C0.hcd
+
+# The following files are extracted from https://github.com/radxa/firmware/tree/9688073218f24a6976e4b668077a957d0e1a0d94/brcm.
+# BCM4345C0_003.001.025.0162.0000_Generic_UART_37_4MHz_wlbga_ref_iLNA_iTR_eLG.hcd copied to match our driver's naming expectations.
+# https://github.com/radxa/firmware/blob/master/brcm/brcmfmac43455-sdio.txt copied to our drivers naming expectations.
+bluetooth/bcm4345c0/BCM4345C0.hcd
