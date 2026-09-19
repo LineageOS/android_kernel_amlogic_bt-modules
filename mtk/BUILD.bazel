@@ -1,0 +1,17 @@
+package(
+    default_visibility = ["//visibility:public"],
+)
+
+exports_files(["Makefile"])
+
+filegroup(
+    name = "btmtk_usb_srcs",
+    srcs = ["Makefile"] + glob(
+        ["bt_driver_usb/**"],
+        exclude = [
+            "**/BUILD.bazel",
+            "**/*.bzl",
+            ".git/**",
+        ],
+    ),
+)
