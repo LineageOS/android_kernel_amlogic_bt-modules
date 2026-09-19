@@ -1,9 +1,0 @@
-# SPDX-License-Identifier: (GPL-2.0+ OR MIT)
-
-KERNEL_SRC ?= /lib/modules/$(shell uname -r)/build
-M ?= $(shell pwd)
-
-BTUSB_DIR := broadcom/btusb/btusb_1_6_29_1
-
-modules modules_install clean:
-	$(MAKE) -C $(KERNEL_SRC)/$(M)/$(BTUSB_DIR) M=$(M)/$(BTUSB_DIR) KERNEL_SRC=$(KERNEL_SRC) $(@)
