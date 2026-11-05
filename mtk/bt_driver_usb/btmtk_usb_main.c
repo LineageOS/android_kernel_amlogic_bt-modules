@@ -185,6 +185,37 @@ static struct device *pBTDev;
 static struct device *pBTDevfwlog;
 static struct device *pBTDev_sco;
 
+/*
+ * Bluetooth addresses of the remote controls allowed to wake the host from WoBLE, written by
+ * userspace as "AA:BB:CC:DD:EE:FF;" entries (the format of Xiaomi's firmware).
+ */
+#define RC_LIST_MAX_ENTRIES	4
+#define RC_LIST_ENTRY_LEN	18	/* "AA:BB:CC:DD:EE:FF;" */
+static char rc_list[RC_LIST_MAX_ENTRIES * RC_LIST_ENTRY_LEN + 1];
+static DEFINE_MUTEX(rc_list_mutex);
+
+static ssize_t rclist_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	ssize_t len;
+
+	mutex_lock(&rc_list_mutex);
+	len = scnprintf(buf, PAGE_SIZE, "%s\n", rc_list);
+	mutex_unlock(&rc_list_mutex);
+	return len;
+}
+
+static ssize_t rclist_store(struct device *dev, struct device_attribute *attr,
+		const char *buf, size_t count)
+{
+	mutex_lock(&rc_list_mutex);
+	strscpy(rc_list, buf, sizeof(rc_list));
+	rc_list[strcspn(rc_list, "\n")] = '\0';
+	mutex_unlock(&rc_list_mutex);
+	BTUSB_INFO("%s: %s", __func__, rc_list);
+	return count;
+}
+static DEVICE_ATTR_RW(rclist);
+
 static struct cdev BT_cdev;
 static struct cdev BT_cdevfwlog;
 static struct cdev BT_cdev_sco;
@@ -2564,6 +2595,8 @@ static int btmtk_usb_BT_init(void)
 		BTUSB_ERR("device create fail, error code(%ld)", PTR_ERR(pBTDev));
 		goto err2;
 	}
+	if (device_create_file(pBTDev, &dev_attr_rclist))
+		BTUSB_WARN("%s: device_create_file rclist failed", __func__);
 
 	pBTDevfwlog = device_create(pBTClass, NULL,
 		devIDfwlog, NULL, "%s", "stpbtfwlog");
@@ -2689,6 +2722,7 @@ static void btmtk_usb_BT_exit(void)
 	}
 
 	if (pBTDev) {
+		device_remove_file(pBTDev, &dev_attr_rclist);
 		device_destroy(pBTClass, dev);
 		pBTDev = NULL;
 	}
@@ -2892,6 +2926,128 @@ done:
 	return ret;
 }
 
+/*
+ * Stops LE scanning before entering WoBLE, so that the stack's scan doesn't compete with the
+ * controller's own filtering. Failures are not fatal: the legacy or extended command may be
+ * unsupported.
+ */
+static void btmtk_usb_send_disable_ble_scan(void)
+{
+	u8 ext_scan[] = { 0x42, 0x20, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00 };
+	u8 ext_scan_event[] = { 0x0E, 0x04, 0x01, 0x42, 0x20 };
+	u8 scan[] = { 0x0C, 0x20, 0x02, 0x00, 0x01 };
+	u8 scan_event[] = { 0x0E, 0x04, 0x01, 0x0C, 0x20 };
+
+	if (btmtk_usb_send_hci_cmd(ext_scan, sizeof(ext_scan), ext_scan_event, sizeof(ext_scan_event)) < 0)
+		BTUSB_WARN("%s: LE set extended scan enable failed", __func__);
+	if (btmtk_usb_send_hci_cmd(scan, sizeof(scan), scan_event, sizeof(scan_event)) < 0)
+		BTUSB_WARN("%s: LE set scan enable failed", __func__);
+}
+
+#define RC_APCF_INDEX		0x0B
+#define HOST_APCF_INDEX		0x0A
+
+/* The filters btmtk_usb_set_Woble_APCF_7663() added on the last WoBLE entry, removed on resume */
+static bool host_apcf_added;
+static bool rc_apcf_added;
+
+static int btmtk_usb_rc_addr_from_str(const char *str, u8 *addr)
+{
+	unsigned int b[BD_ADDRESS_SIZE];
+	int i;
+
+	if (sscanf(str, "%2x:%2x:%2x:%2x:%2x:%2x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
+		return -EINVAL;
+	/* HCI order: least significant byte first */
+	for (i = 0; i < BD_ADDRESS_SIZE; i++)
+		addr[i] = b[BD_ADDRESS_SIZE - 1 - i];
+	return 0;
+}
+
+/*
+ * MT7663 on Xiaomi boxes: the WoBLE filters of Xiaomi's firmware. A disconnected Xiaomi remote
+ * advertises with the local name "MI RC" and Xiaomi's manufacturer data, also right after its link
+ * drops, so filter RC_APCF_INDEX also requires one of the addresses userspace wrote to rclist.
+ * Without any, the filter is left out: matching any "MI RC" advertiser wakes the host as soon as it
+ * suspends. HOST_APCF_INDEX is MediaTek's filter on the host's own address. The radio off command
+ * arms both.
+ */
+static int btmtk_usb_set_Woble_APCF_7663(void)
+{
+	u8 name[] = { 0x57, 0xFD, 0x08, 0x05, 0x00, RC_APCF_INDEX, 'M', 'I', ' ', 'R', 'C' };
+	u8 manufacturer[] = { 0x57, 0xFD, 0x07, 0x06, 0x00, RC_APCF_INDEX, 0x00, 0x01, 0x00, 0xFF };
+	u8 address[] = { 0x57, 0xFD, 0x0A, 0x02, 0x00, RC_APCF_INDEX,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 /* public */ };
+	/* Feature selection: 0x01 address, 0x10 local name, 0x20 manufacturer data; all must match */
+	u8 rc_param[] = { 0x57, 0xFD, 0x0A, 0x01, 0x00, RC_APCF_INDEX,
+		0x31, 0x00, 0x00, 0x00, 0x01, 0x80, 0x00 };
+	u8 host[] = { 0x57, 0xFD, 0x23, 0x03, 0x00, HOST_APCF_INDEX,
+		0x00, 0x01, 0x02, 0x01, 0x05, 0x03, 0xFF, 0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00 /* host BDADDR */, 0x00,
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+	u8 host_param[] = { 0x57, 0xFD, 0x0A, 0x01, 0x00, HOST_APCF_INDEX,
+		0x04, 0x00, 0x00, 0x00, 0x01, 0x80, 0x00 };
+	u8 event[] = { 0x0E, 0x07, 0x01, 0x57, 0xFD, 0x00 };
+	u8 remotes[RC_LIST_MAX_ENTRIES][BD_ADDRESS_SIZE];
+	char list[sizeof(rc_list)];
+	char *cur, *entry;
+	int count = 0;
+	int i, ret;
+
+	host_apcf_added = false;
+	rc_apcf_added = false;
+	mutex_lock(&rc_list_mutex);
+	strscpy(list, rc_list, sizeof(list));
+	mutex_unlock(&rc_list_mutex);
+	cur = list;
+	while ((entry = strsep(&cur, ";")) != NULL && count < RC_LIST_MAX_ENTRIES) {
+		if (!*entry)
+			continue;
+		if (btmtk_usb_rc_addr_from_str(strim(entry), remotes[count])) {
+			BTUSB_WARN("%s: ignoring rclist entry \"%s\"", __func__, entry);
+			continue;
+		}
+		count++;
+	}
+
+	if (count) {
+		ret = btmtk_usb_send_hci_cmd(name, sizeof(name), event, sizeof(event));
+		if (ret < 0)
+			goto fail;
+		ret = btmtk_usb_send_hci_cmd(manufacturer, sizeof(manufacturer), event, sizeof(event));
+		if (ret < 0)
+			goto fail;
+		for (i = 0; i < count; i++) {
+			memcpy(address + 6, remotes[i], BD_ADDRESS_SIZE);
+			ret = btmtk_usb_send_hci_cmd(address, sizeof(address), event, sizeof(event));
+			if (ret < 0)
+				goto fail;
+		}
+		ret = btmtk_usb_send_hci_cmd(rc_param, sizeof(rc_param), event, sizeof(event));
+		if (ret < 0)
+			goto fail;
+		rc_apcf_added = true;
+		BTUSB_INFO("%s: %d remote(s) can wake the host", __func__, count);
+	} else {
+		BTUSB_WARN("%s: rclist is empty, remotes can't wake the host", __func__);
+	}
+
+	memcpy(host + 15, g_data->bdaddr, BD_ADDRESS_SIZE);
+	ret = btmtk_usb_send_hci_cmd(host, sizeof(host), event, sizeof(event));
+	if (ret < 0)
+		goto fail;
+	ret = btmtk_usb_send_hci_cmd(host_param, sizeof(host_param), event, sizeof(event));
+	if (ret < 0)
+		goto fail;
+	host_apcf_added = true;
+	return 0;
+
+fail:
+	BTUSB_ERR("%s: failed(%d)", __func__, ret);
+	return ret;
+}
+
 /**
  * Set APCF manufacturer data and filter parameter
  */
@@ -2915,12 +3071,14 @@ static int btmtk_usb_set_Woble_APCF(void)
 			if (!g_data->woble_setting_apcf[i].length)
 				continue;
 
-			BTUSB_INFO("%s: apcf_fill_mac[%d].content[0] = 0x%02x", __func__, i,
-					g_data->woble_setting_apcf_fill_mac[i].content[0]);
+			/* APCF_ADD_MAC and APCF_ADD_MAC_LOCATION are optional for each APCF entry */
+			BTUSB_INFO("%s: apcf_fill_mac[%d].length = %d", __func__, i,
+					g_data->woble_setting_apcf_fill_mac[i].length);
 			BTUSB_INFO("%s: apcf_fill_mac_location[%d].length = %d", __func__, i,
 					g_data->woble_setting_apcf_fill_mac_location[i].length);
 
-			if ((g_data->woble_setting_apcf_fill_mac[i].content[0] == 1) &&
+			if (g_data->woble_setting_apcf_fill_mac[i].length &&
+				g_data->woble_setting_apcf_fill_mac[i].content[0] == 1 &&
 				g_data->woble_setting_apcf_fill_mac_location[i].length) {
 				/* need add BD addr to apcf cmd */
 				memcpy(g_data->woble_setting_apcf[i].content +
@@ -2940,6 +3098,11 @@ static int btmtk_usb_set_Woble_APCF(void)
 				return ret;
 			}
 		}
+	} else if (is_mt7663(g_data)) {
+		btmtk_usb_send_disable_ble_scan();
+		ret = btmtk_usb_set_Woble_APCF_7663();
+		if (ret < 0)
+			return ret;
 	} else { /* use default */
 		BTUSB_INFO("%s: use default manufactur data", __func__);
 		memcpy(manufactur_data + 9, g_data->bdaddr, BD_ADDRESS_SIZE);
@@ -3006,7 +3169,19 @@ static int btmtk_usb_del_Woble_APCF_index(void)
 	u8 event[] = { 0x0e, 0x07, 0x01, 0x57, 0xfd, 0x00, 0x01, /* 00, 63 */ };
 
 	BTUSB_INFO("%s", __func__);
-	ret = btmtk_usb_send_hci_cmd(cmd, sizeof(cmd), event, sizeof(event));
+	if (host_apcf_added) {
+		/* The MT7663 filters, see btmtk_usb_set_Woble_APCF_7663() */
+		cmd[5] = HOST_APCF_INDEX;
+		ret = btmtk_usb_send_hci_cmd(cmd, sizeof(cmd), event, sizeof(event));
+		if (ret >= 0 && rc_apcf_added) {
+			cmd[5] = RC_APCF_INDEX;
+			ret = btmtk_usb_send_hci_cmd(cmd, sizeof(cmd), event, sizeof(event));
+		}
+		host_apcf_added = false;
+		rc_apcf_added = false;
+	} else {
+		ret = btmtk_usb_send_hci_cmd(cmd, sizeof(cmd), event, sizeof(event));
+	}
 	if (ret < 0) {
 		BTUSB_ERR("%s: Got error %d", __func__, ret);
 		return ret;
@@ -3052,11 +3227,42 @@ static int btmtk_usb_send_unify_woble_suspend_cmd(void)
 	u8 cmd[] = { 0xC9, 0xFC, 0x14, 0x01, 0x20, 0x02, 0x00, 0x01,
 		0x02, 0x01, 0x00, 0x05, 0x10, 0x01, 0x00, 0x40, 0x06,
 		0x02, 0x40, 0x5A, 0x02, 0x41, 0x0F };
+	/*
+	 * MT7663 (Xiaomi's firmware): wakes on APCF filters 0x0A and 0x0B; 0x46 carries the low
+	 * half of the host BDADDR. The waveform variant (unify_woble_type 1) adds the wake signal
+	 * settings (0x42, 0x48, 0x49).
+	 */
+	u8 cmd_7663[] = { 0xC9, 0xFC, 0x35, 0x01, 0x20, 0x02, 0x00, 0x01, 0x02, 0x01, 0x00,
+		0x09, 0x10, 0x02, 0x00, 0x10, 0x00, 0x10, 0x00, 0x2C, 0x01, 0x05, 0x24, 0xF0, 0x00, 0x32, 0x00,
+		0x03, 0x40, 0x0A, 0x0B, 0x03, 0x43, 0x40, 0x06, 0x04, 0x46, 0x00, 0x00, 0x00,
+		0x09, 0x26, 0x20, 0x1C, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x05, 0x22, 0xF7, 0xFF, 0xFF, 0xFF };
+	u8 cmd_7663_waveform[] = { 0xC9, 0xFC, 0x53, 0x01, 0x20, 0x02, 0x00, 0x01, 0x02, 0x01, 0x00,
+		0x09, 0x10, 0x02, 0x00, 0x08, 0x00, 0x80, 0x00, 0x02, 0x00, 0x05, 0x24, 0xF0, 0x00, 0x32, 0x00,
+		0x03, 0x40, 0x0A, 0x0B, 0x04, 0x42, 0x00, 0x01, 0x02, 0x03, 0x43, 0x40, 0x06,
+		0x04, 0x46, 0x00, 0x00, 0x00,
+		0x12, 0x48, 0x01, 0x00, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0xFE, 0xFE, 0x01, 0x00, 0x00, 0x10,
+		0x00, 0x4A, 0xFF,
+		0x09, 0x26, 0x20, 0x1C, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00, 0x05, 0x22, 0xF7, 0xFF, 0xFF, 0xFF,
+		0x05, 0x49, 0x00, 0x01, 0x00, 0x00 };
 	u8 status[] = { 0x0F, 0x04, 0x00, 0x01, 0xC9, 0xFC };
 	u8 comp_event[] = { 0xE6, 0x02, 0x08, 0x00 };
+	u8 *radio_off = cmd;
+	int len = sizeof(cmd);
+
+	if (is_mt7663(g_data)) {
+		if (g_data->bt_cfg.unify_woble_type == 1) {
+			memcpy(cmd_7663_waveform + 42, g_data->bdaddr, 3);
+			radio_off = cmd_7663_waveform;
+			len = sizeof(cmd_7663_waveform);
+		} else {
+			memcpy(cmd_7663 + 37, g_data->bdaddr, 3);
+			radio_off = cmd_7663;
+			len = sizeof(cmd_7663);
+		}
+	}
 
 	BTUSB_DBG("%s: begin", __func__);
-	ret = btmtk_usb_send_hci_cmd(cmd, sizeof(cmd), status, sizeof(status));
+	ret = btmtk_usb_send_hci_cmd(radio_off, len, status, sizeof(status));
 	if (ret < 0) {
 		BTUSB_ERR("%s: failed(%d)", __func__, ret);
 		return ret;
