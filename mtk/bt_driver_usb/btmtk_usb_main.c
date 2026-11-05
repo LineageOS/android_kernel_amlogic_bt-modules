@@ -2232,6 +2232,19 @@ static int btmtk_usb_add_to_hci_log(const u8 *buf, int buf_len, int hci_type)
 	return ret;
 }
 
+#define HCE_CMD_COMPLETE	0x0E
+#define HCE_CMD_STATUS		0x0F
+
+/* Whether evt is the command complete or command status event of the command with cmd's opcode */
+static bool btmtk_usb_is_cmd_response(const u8 *evt, int len, const u8 *cmd)
+{
+	if (evt[0] == HCE_CMD_COMPLETE && len >= 5)
+		return evt[3] == cmd[0] && evt[4] == cmd[1];
+	if (evt[0] == HCE_CMD_STATUS && len >= 6)
+		return evt[4] == cmd[0] && evt[5] == cmd[1];
+	return false;
+}
+
 static int btmtk_usb_send_hci_cmd(const u8 *cmd, const int cmd_len,
 		const u8 *event, const int event_len)
 {
@@ -2314,6 +2327,14 @@ static int btmtk_usb_send_hci_cmd(const u8 *cmd, const int cmd_len,
 				BTUSB_ERR("%s: event length is not match(%d/%d)", __func__, len, event_len);
 			}
 			if (i != event_len) {
+				/*
+				 * The response to this command itself (e.g. a command status before a vendor
+				 * event): the stack didn't send the command, so it mustn't get the response.
+				 */
+				if (btmtk_usb_is_cmd_response(g_data->io_buf, len, cmd)) {
+					BTUSB_INFO_RAW(g_data->io_buf, len, "%s: drop response:", __func__);
+					continue;
+				}
 				/* In case standard or picus event */
 				if (btmtk_usb_dispatch_event(g_data->io_buf, len) < 0) {
 					BTUSB_WARN("%s: got unexpected event:(%d/%d), actual len = %d",
