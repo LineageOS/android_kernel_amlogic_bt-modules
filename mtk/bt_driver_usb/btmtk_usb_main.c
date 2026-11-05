@@ -186,8 +186,9 @@ static struct device *pBTDevfwlog;
 static struct device *pBTDev_sco;
 
 /*
- * Bluetooth addresses of the remote controls allowed to wake the host from WoBLE, written by
- * userspace as "AA:BB:CC:DD:EE:FF;" entries (the format of Xiaomi's firmware).
+ * Bluetooth addresses of the remote controls allowed to wake the host from WoBLE, as
+ * "AA:BB:CC:DD:EE:FF;" entries (the format of Xiaomi's firmware): learned from the stack's
+ * commands (see btmtk_usb_rc_list_learn()) or written by userspace.
  */
 #define RC_LIST_MAX_ENTRIES	4
 #define RC_LIST_ENTRY_LEN	18	/* "AA:BB:CC:DD:EE:FF;" */
@@ -215,6 +216,31 @@ static ssize_t rclist_store(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 static DEVICE_ATTR_RW(rclist);
+
+/*
+ * The stack adds each bonded LE device to the controller's filter accept list to reconnect it in
+ * the background (and removes it once connected). Remember the public addresses among them, the
+ * address type Xiaomi remotes use: the wake filter also requires the name "MI RC" and Xiaomi's
+ * manufacturer data, so other devices in the list can't wake the host. The oldest entry makes room
+ * for a new one; userspace can still write rclist.
+ */
+static void btmtk_usb_rc_list_learn(const u8 *addr)
+{
+	char entry[RC_LIST_ENTRY_LEN + 1];
+
+	snprintf(entry, sizeof(entry), "%02X:%02X:%02X:%02X:%02X:%02X;",
+			addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+
+	mutex_lock(&rc_list_mutex);
+	if (!strstr(rc_list, entry)) {
+		if (strlen(rc_list) + RC_LIST_ENTRY_LEN >= sizeof(rc_list))
+			memmove(rc_list, rc_list + RC_LIST_ENTRY_LEN,
+					strlen(rc_list + RC_LIST_ENTRY_LEN) + 1);
+		strlcat(rc_list, entry, sizeof(rc_list));
+		BTUSB_INFO("%s: %s", __func__, rc_list);
+	}
+	mutex_unlock(&rc_list_mutex);
+}
 
 static struct cdev BT_cdev;
 static struct cdev BT_cdevfwlog;
@@ -6147,6 +6173,8 @@ static ssize_t btmtk_usb_fops_write(struct file *file, const char __user *buf,
 			u8 fw_assert_cmd[] = { 0x01, 0x6F, 0xFC, 0x05, 0x01, 0x02, 0x01, 0x00, 0x08 };
 			u8 reset_cmd[] = { 0x01, 0x03, 0x0C, 0x00 };
 			u8 read_ver_cmd[] = { 0x01, 0x01, 0x10, 0x00 };
+			/* LE Add Device To Filter Accept List, public address */
+			u8 accept_list_add[] = { 0x01, 0x11, 0x20, 0x07, 0x00 };
 
 			if (copy_size == sizeof(fw_assert_cmd) &&
 				!memcmp(g_data->o_buf, fw_assert_cmd, sizeof(fw_assert_cmd))) {
@@ -6156,6 +6184,10 @@ static ssize_t btmtk_usb_fops_write(struct file *file, const char __user *buf,
 					!memcmp(g_data->o_buf, reset_cmd, sizeof(reset_cmd))) {
 				BTUSB_INFO("%s: got command: 0x03 0C 00 (HCI_RESET)", __func__);
 
+			} else if (is_mt7663(g_data) &&
+					copy_size == sizeof(accept_list_add) + BD_ADDRESS_SIZE &&
+					!memcmp(g_data->o_buf, accept_list_add, sizeof(accept_list_add))) {
+				btmtk_usb_rc_list_learn(g_data->o_buf + sizeof(accept_list_add));
 			} else if (copy_size == sizeof(read_ver_cmd) &&
 					!memcmp(g_data->o_buf, read_ver_cmd, sizeof(read_ver_cmd))) {
 				BTUSB_INFO("%s: got command: 0x01 10 00 (READ_LOCAL_VERSION)", __func__);
