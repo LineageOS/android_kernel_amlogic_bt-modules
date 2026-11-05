@@ -113,6 +113,7 @@ struct bt_cfg_struct {
 	struct fw_cfg_struct picus_filter;	/* support on PICUS filter command customization */
 	int	dongle_reset_gpio_pin;		/* BT_DONGLE_RESET_GPIO_PIN number */
 	unsigned int	unify_woble_type;	/* 0: legacy. 1: waveform. 2: IR */
+	bool	support_mi_rc_woble;		/* wake on Xiaomi remotes, MT7663 with Xiaomi's firmware */
 	char	*sys_log_file_name;
 	char	*fw_dump_file_name;
 	struct fw_cfg_struct wmt_cmd[WMT_CMD_COUNT];
